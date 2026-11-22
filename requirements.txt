@@ -1,0 +1,4 @@
+boto3==1.44.4
+cryptography==50.0.2
+# Only needed by 06_activity_report.py to decrypt Database Activity Streams records
+aws-encryption-sdk==4.0.7

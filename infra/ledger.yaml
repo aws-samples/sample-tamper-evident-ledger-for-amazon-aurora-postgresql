@@ -1,0 +1,785 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Tamper-evident ledger for Amazon Aurora PostgreSQL (sample, non-production).
+  Private-only VPC, Aurora PostgreSQL (Serverless v2 by default) with the RDS Data API, an asymmetric KMS
+  signing key, an S3 bucket with Object Lock in compliance mode for signed anchors, database user
+  secrets, IAM roles for the anchoring function and its schedule, pgAudit logs in CloudWatch Logs, and
+  (optional) an Object Lock archive for Database Activity Streams.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.97.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+    Description: /16 CIDR for the VPC. Two /24 private subnets are carved from it.
+  EngineVersion:
+    Type: String
+    Default: "17.11"
+    Description: Aurora PostgreSQL version. Must support the Data API and a minimum capacity of 0 ACU.
+  MaxCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 16
+    Description: Maximum Aurora capacity units. Minimum is 0 (the cluster pauses when idle).
+  AnchorRetentionDays:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 36500
+    Description: >-
+      Object Lock compliance-mode retention for anchors. Nobody, including the root user, can
+      delete an anchor or the bucket until this many days pass. Keep it short for a trial.
+  InstanceClass:
+    Type: String
+    Default: db.serverless
+    AllowedValues: [db.serverless, db.r6g.large, db.r6g.xlarge, db.r7g.large, db.r7g.xlarge]
+    Description: >-
+      db.serverless pauses when idle. Database Activity Streams needs a provisioned class
+      (01_deploy.py --activity-stream selects db.r6g.large).
+  EnableActivityStreamArchive:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Create the KMS key, Object Lock bucket and Firehose role for Database Activity Streams.
+  AuditLogRetentionDays:
+    Type: Number
+    Default: 3653
+    AllowedValues: [365, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Retention of the pgAudit log group in CloudWatch Logs.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+$'
+    Description: Optional email address subscribed to the alarm topic (confirm the subscription email).
+  DeletionProtection:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Aurora deletion protection. 99_cleanup.py turns it off before deleting the stack.
+
+Conditions:
+  ArchiveActivityStream: !Equals [!Ref EnableActivityStreamArchive, "true"]
+  AlarmEmailSet: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+# Static analysis suppressions (cfn_nag and Checkov carry their reason next to the rule; cfn-guard
+# SuppressedRules has no reason field, so the reasons are listed here):
+#   CW_LOGGROUP_RETENTION_PERIOD_CHECK      AuditLogGroup sets RetentionInDays from a parameter (default 3653 days).
+#   IAM_NO_INLINE_POLICY_CHECK              Each role has one least-privilege inline policy scoped to this stack's resources.
+#   KMS_NO_WILDCARD_PRINCIPAL               The wildcard principal is only in an explicit Deny (only the anchoring role may sign).
+#   RDS_MASTER_USER_PASSWORD_USES_SECURE_PARAMETER  The master password is managed by RDS in Secrets Manager (ManageMasterUserPassword).
+#   RDS_MULTI_AZ_SUPPORT                    Single-instance sample; add a reader in another AZ for production.
+#   RDS_STORAGE_ENCRYPTED                   Storage encryption is set on the Aurora cluster (StorageEncrypted: true), not on instances or parameter groups.
+#   S3_BUCKET_NO_PUBLIC_RW_ACL              Buckets use BucketOwnerEnforced (ACLs disabled) and block all public access.
+#   SECRETSMANAGER_ROTATION_ENABLED_CHECK   Rotation is out of scope for the sample; see README security considerations.
+
+Resources:
+  # ---------------------------------------------------------------- network (no internet path)
+  Vpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W60
+            reason: Sample VPC with no internet path and no compute; flow logs are left to the operator.
+      checkov:
+        skip:
+          - id: CKV2_AWS_11
+            comment: Sample VPC with no internet path and no compute; flow logs are left to the operator.
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-vpc" }
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 2, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-a" }
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 2, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-b" }
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  # The cluster is reached only through the Data API, so its security group has no ingress rules.
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV2_AWS_5
+            comment: Attached to the Aurora cluster below.
+    Properties:
+      GroupDescription: Aurora ledger cluster (no inbound access; Data API only)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+          Description: No outbound traffic
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the ledger cluster
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  # ---------------------------------------------------------------- database
+  # pgAudit records DDL and role/privilege changes; the logs go to CloudWatch Logs.
+  ClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - RDS_STORAGE_ENCRYPTED
+    Properties:
+      Description: !Sub "${AWS::StackName} ledger cluster with pgAudit"
+      Family: !Join ["", ["aurora-postgresql", !Select [0, !Split [".", !Ref EngineVersion]]]]
+      Parameters:
+        shared_preload_libraries: pgaudit
+        pgaudit.log: ddl,role
+        pgaudit.log_catalog: "0"
+        pgaudit.log_parameter: "0"
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  # Created before the cluster so that its retention applies; Aurora writes postgresql.log here.
+  AuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CW_LOGGROUP_RETENTION_PERIOD_CHECK
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Log data contains no secrets (counts, object keys, pgAudit DDL with passwords redacted); encrypted with the CloudWatch Logs default key. Use a customer managed key if your policy requires it.
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: Encrypted with the default CloudWatch Logs key; use a customer managed key if required.
+    Properties:
+      LogGroupName: !Sub "/aws/rds/cluster/${AWS::StackName}-db/postgresql"
+      RetentionInDays: !Ref AuditLogRetentionDays
+
+  Cluster:
+    Type: AWS::RDS::DBCluster
+    DependsOn: AuditLogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_327
+            comment: Storage is encrypted with the AWS managed key; use a customer managed key in production.
+          - id: CKV_AWS_162
+            comment: The sample uses the Data API with Secrets Manager credentials instead of IAM database authentication.
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: !Ref EngineVersion
+      DBClusterIdentifier: !Sub "${AWS::StackName}-db"
+      MasterUsername: ledger_admin
+      ManageMasterUserPassword: true
+      EnableHttpEndpoint: true
+      StorageEncrypted: true
+      DeletionProtection: !Ref DeletionProtection
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      EnableCloudwatchLogsExports: [postgresql]
+      DBClusterParameterGroupName: !Ref ClusterParameterGroup
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref DbSecurityGroup]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0
+        MaxCapacity: !Ref MaxCapacity
+        SecondsUntilAutoPause: 300
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  ClusterInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      guard:
+        SuppressedRules:
+          - RDS_MASTER_USER_PASSWORD_USES_SECURE_PARAMETER
+          - RDS_MULTI_AZ_SUPPORT
+          - RDS_STORAGE_ENCRYPTED
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Name derived from the stack name so the scripts and operators can find the resource; the stack name keeps it unique.
+      checkov:
+        skip:
+          - id: CKV_AWS_118
+            comment: Enhanced monitoring is optional for a sample.
+    Properties:
+      DBClusterIdentifier: !Ref Cluster
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-db-1"
+      DBInstanceClass: !Ref InstanceClass
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  # Credentials of the three database users. Passwords are generated by Secrets Manager;
+  # 02_init_ledger.py sets them on the database roles.
+  AppUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECRETSMANAGER_ROTATION_ENABLED_CHECK
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: Secret is used in this account only and encrypted with the AWS managed key for Secrets Manager.
+      checkov:
+        skip:
+          - id: CKV2_AWS_57
+            comment: Rotation is out of scope for the sample; see README security considerations.
+          - id: CKV_AWS_149
+            comment: Encrypted with the AWS managed key for Secrets Manager.
+    Properties:
+      Name: !Sub "${AWS::StackName}/db/app_user"
+      Description: Ledger sample application user (can write ledger tables only)
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "app_user"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  AuditorSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECRETSMANAGER_ROTATION_ENABLED_CHECK
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: Secret is used in this account only and encrypted with the AWS managed key for Secrets Manager.
+      checkov:
+        skip:
+          - id: CKV2_AWS_57
+            comment: Rotation is out of scope for the sample; see README security considerations.
+          - id: CKV_AWS_149
+            comment: Encrypted with the AWS managed key for Secrets Manager.
+    Properties:
+      Name: !Sub "${AWS::StackName}/db/auditor"
+      Description: Ledger sample auditor (read-only history and verification functions)
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "auditor"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  SealerSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECRETSMANAGER_ROTATION_ENABLED_CHECK
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: Secret is used in this account only and encrypted with the AWS managed key for Secrets Manager.
+      checkov:
+        skip:
+          - id: CKV2_AWS_57
+            comment: Rotation is out of scope for the sample; see README security considerations.
+          - id: CKV_AWS_149
+            comment: Encrypted with the AWS managed key for Secrets Manager.
+    Properties:
+      Name: !Sub "${AWS::StackName}/db/ledger_sealer"
+      Description: Ledger sample sealer (seal_all and list_digests only), used by the anchoring function
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "ledger_sealer"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  # ---------------------------------------------------------------- signing key
+  # Only the anchoring function's role may sign. The explicit deny also applies to account
+  # administrators; the account keeps the right to manage (and, if needed, change) the policy.
+  SigningKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Metadata:
+      guard:
+        SuppressedRules:
+          - KMS_NO_WILDCARD_PRINCIPAL
+      cfn_nag:
+        rules_to_suppress:
+          - id: F19
+            reason: Asymmetric KMS keys do not support automatic key rotation. Rotating would require a new key; anchors signed by the old key stay verifiable with its retained public key.
+    Properties:
+      Description: !Sub "${AWS::StackName} ledger anchor signing key (sample)"
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountManagesKey
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: OnlyAnchorFunctionMaySign
+            Effect: Deny
+            Principal: "*"
+            Action: kms:Sign
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-anchor-function"
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  SigningKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-anchor-signing"
+      TargetKeyId: !Ref SigningKey
+
+  # ---------------------------------------------------------------- anchor bucket (WORM)
+  # Retained on stack deletion: compliance-mode objects cannot be deleted before they expire.
+  AnchorBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      guard:
+        SuppressedRules:
+          # ACLs are disabled (BucketOwnerEnforced) and all four Block Public Access settings are on.
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: Access logging is left to the operator for the sample; writes are restricted by the bucket policy. Enable server access logging or CloudTrail S3 data events in production (see README).
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Access logging is left to the operator for the sample; enable server access logging or CloudTrail S3 data events in production.
+          - id: CKV_AWS_144
+            comment: Cross-Region replication is out of scope for the sample.
+          - id: CKV_AWS_145
+            comment: SSE-S3 is used; a customer managed key is optional.
+    Properties:
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Days: !Ref AnchorRetentionDays
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  AnchorBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AnchorBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt AnchorBucket.Arn, !Sub "${AnchorBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: false } }
+          - Sid: OnlyAnchorFunctionWritesAnchors
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${AnchorBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-anchor-function"
+
+  # ---------------------------------------------------------------- anchoring function
+  AnchorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Log data contains no secrets (counts, object keys, pgAudit DDL with passwords redacted); encrypted with the CloudWatch Logs default key. Use a customer managed key if your policy requires it.
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: Logs contain object keys and counts only; encrypted with the default CloudWatch Logs key.
+          - id: CKV_AWS_66
+            comment: Retention is set below.
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-anchor"
+      RetentionInDays: 30
+
+  AnchorFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Fixed name is referenced by the KMS key policy and S3 bucket policies (aws:PrincipalArn) and by the scripts; the stack name keeps it unique.
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-anchor-function"
+      Description: Anchoring function for the tamper-evident ledger sample
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: anchor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DataApiOnLedgerCluster
+                Effect: Allow
+                Action: rds-data:ExecuteStatement
+                Resource: !GetAtt Cluster.DBClusterArn
+              - Sid: SealerCredentialsOnly
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SealerSecret
+              - Sid: SignAnchors
+                Effect: Allow
+                Action: kms:Sign
+                Resource: !GetAtt SigningKey.Arn
+              - Sid: WriteAnchors
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${AnchorBucket.Arn}/anchors/*"
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${AnchorFunctionLogGroup.Arn}:*"
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Name derived from the stack name so the scripts and operators can find the resource; the stack name keeps it unique.
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-anchor-scheduler"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                # EventBridge Scheduler sets aws:SourceArn to the schedule group; the scripts use the default group.
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/default"
+      Policies:
+        - PolicyName: invoke-anchor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-anchor"
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  # Fires when the function errors, and when it has not run for 5 minutes (schedule removed or failing).
+  # Alarm notifications. Encrypted with the AWS managed key for SNS.
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alarms"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudWatchAlarmsPublish
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition: { Bool: { aws:SecureTransport: false } }
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: AlarmEmailSet
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  AnchorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Name derived from the stack name so the scripts and operators can find the resource; the stack name keeps it unique.
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-anchor-errors"
+      AlarmDescription: The ledger anchoring function returned an error
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Sub "${AWS::StackName}-anchor" }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+      InsufficientDataActions: [!Ref AlarmTopic]
+
+  AnchorMissingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Name derived from the stack name so the scripts and operators can find the resource; the stack name keeps it unique.
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-anchor-missing"
+      AlarmDescription: The ledger anchoring function has not run for 5 minutes
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions: [{ Name: FunctionName, Value: !Sub "${AWS::StackName}-anchor" }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+      InsufficientDataActions: [!Ref AlarmTopic]
+
+  # ---------------------------------------------------------------- activity stream archive (optional)
+  # Database Activity Streams is started by 01_deploy.py --activity-stream (it has no CloudFormation
+  # property). Records arrive in a Kinesis stream named aws-rds-das-<cluster resource ID>, encrypted
+  # with this key; Firehose copies them unchanged into the Object Lock bucket below.
+  ActivityStreamKey:
+    Type: AWS::KMS::Key
+    Condition: ArchiveActivityStream
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "${AWS::StackName} Database Activity Streams key (sample)"
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountManagesKey
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  ActivityArchiveBucket:
+    Type: AWS::S3::Bucket
+    Condition: ArchiveActivityStream
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      guard:
+        SuppressedRules:
+          # ACLs are disabled (BucketOwnerEnforced) and all four Block Public Access settings are on.
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: Access logging is left to the operator for the sample; writes are restricted by the bucket policy. Enable server access logging or CloudTrail S3 data events in production (see README).
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Access logging is left to the operator for the sample; enable server access logging or CloudTrail S3 data events in production.
+          - id: CKV_AWS_144
+            comment: Cross-Region replication is out of scope for the sample.
+          - id: CKV_AWS_145
+            comment: Records are already encrypted by Database Activity Streams; the bucket adds SSE-S3.
+    Properties:
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Days: !Ref AnchorRetentionDays
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+  ActivityArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ArchiveActivityStream
+    Properties:
+      Bucket: !Ref ActivityArchiveBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ActivityArchiveBucket.Arn, !Sub "${ActivityArchiveBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: false } }
+          - Sid: OnlyFirehoseWritesArchive
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${ActivityArchiveBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-activity-firehose"
+
+  ActivityFirehoseRole:
+    Type: AWS::IAM::Role
+    Condition: ArchiveActivityStream
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Fixed name is referenced by the KMS key policy and S3 bucket policies (aws:PrincipalArn) and by the scripts; the stack name keeps it unique.
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-activity-firehose"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: firehose.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                # The delivery stream is created by the scripts with this fixed name.
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${AWS::StackName}-activity-archive"
+      Policies:
+        - PolicyName: archive
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadActivityStream
+                Effect: Allow
+                Action: [kinesis:DescribeStream, kinesis:GetShardIterator, kinesis:GetRecords, kinesis:ListShards]
+                Resource: !Sub "arn:${AWS::Partition}:kinesis:${AWS::Region}:${AWS::AccountId}:stream/aws-rds-das-${Cluster.DBClusterResourceId}"
+              - Sid: WriteArchive
+                Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload, s3:GetBucketLocation, s3:ListBucket, s3:ListBucketMultipartUploads]
+                Resource: [!GetAtt ActivityArchiveBucket.Arn, !Sub "${ActivityArchiveBucket.Arn}/*"]
+      Tags:
+        - { Key: purpose, Value: tamper-evident-ledger-sample }
+
+Outputs:
+  ClusterArn: { Value: !GetAtt Cluster.DBClusterArn }
+  ClusterIdentifier: { Value: !Ref Cluster }
+  MasterSecretArn: { Value: !GetAtt Cluster.MasterUserSecret.SecretArn }
+  AppUserSecretArn: { Value: !Ref AppUserSecret }
+  AuditorSecretArn: { Value: !Ref AuditorSecret }
+  SealerSecretArn: { Value: !Ref SealerSecret }
+  SigningKeyArn: { Value: !GetAtt SigningKey.Arn }
+  AnchorBucket: { Value: !Ref AnchorBucket }
+  AnchorFunctionRoleArn: { Value: !GetAtt AnchorFunctionRole.Arn }
+  SchedulerRoleArn: { Value: !GetAtt SchedulerRole.Arn }
+  AlarmTopicArn: { Value: !Ref AlarmTopic }
+  ClusterResourceId: { Value: !GetAtt Cluster.DBClusterResourceId }
+  AuditLogGroup: { Value: !Ref AuditLogGroup }
+  ActivityStreamKeyArn:
+    Condition: ArchiveActivityStream
+    Value: !GetAtt ActivityStreamKey.Arn
+  ActivityArchiveBucket:
+    Condition: ArchiveActivityStream
+    Value: !Ref ActivityArchiveBucket
+  ActivityFirehoseRoleArn:
+    Condition: ArchiveActivityStream
+    Value: !GetAtt ActivityFirehoseRole.Arn

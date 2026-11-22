@@ -1,0 +1,10 @@
+# Reports and the exported public key can contain account IDs and ARNs; never commit them
+results/
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# macOS
+.DS_Store
